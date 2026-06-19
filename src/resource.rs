@@ -387,7 +387,8 @@ impl ResourcePlan {
                 if backend == AcceleratorBackend::Metal && accel.unified_memory {
                     embedding.max_batch_tokens = 65536;
                 }
-                embedding.hybrid_mode = if memory.system_total_bytes.is_some_and(|b| b >= 32 * GIB) {
+                embedding.hybrid_mode = if memory.system_total_bytes.is_some_and(|b| b >= 32 * GIB)
+                {
                     HybridMode::Balanced
                 } else {
                     HybridMode::Off
@@ -504,7 +505,10 @@ mod tests {
         assert_eq!(plan.locate_search.max_concurrent_requests, 1);
         assert_eq!(plan.locate_search.semantic_query_concurrency, 1);
         assert_eq!(plan.locate_search.rerank_batch_size, 20);
-        assert_eq!(plan.locate_search.cross_encoder_policy, CrossEncoderPolicy::Off);
+        assert_eq!(
+            plan.locate_search.cross_encoder_policy,
+            CrossEncoderPolicy::Off
+        );
 
         // bench
         assert_eq!(plan.bench.citable_freeze_parallelism, 1);
@@ -592,7 +596,10 @@ mod tests {
         assert_eq!(plan.embedding.max_entities_per_graph_chunk, 64);
         assert_eq!(plan.embedding.hybrid_mode, HybridMode::Off);
         assert_eq!(plan.embedding.nonfinite_policy, NonfinitePolicy::Error);
-        assert_eq!(plan.locate_search.cross_encoder_policy, CrossEncoderPolicy::Off);
+        assert_eq!(
+            plan.locate_search.cross_encoder_policy,
+            CrossEncoderPolicy::Off
+        );
         assert!(plan.watchdog.enabled);
     }
 
