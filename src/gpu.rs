@@ -1452,7 +1452,7 @@ mod tests {
             for head in 0..heads_per_group {
                 let head_idx = group * heads_per_group + head;
                 let head_base = head_idx * seq_len * head_dim;
-                let slope = if has_alibi { alibi_slopes[head] } else { 0.0 };
+                let slope = alibi_slopes.get(head).copied().unwrap_or(0.0);
 
                 for query_pos in 0..seq_len {
                     let q_off = head_base + query_pos * head_dim;
@@ -1461,8 +1461,8 @@ mod tests {
                     let mut denom = 0.0f32;
                     let mut acc = vec![0.0f32; head_dim];
 
-                    for key_pos in 0..seq_len {
-                        if mask[key_pos] == 0 {
+                    for (key_pos, &keep) in mask.iter().enumerate().take(seq_len) {
+                        if keep == 0 {
                             continue;
                         }
 
