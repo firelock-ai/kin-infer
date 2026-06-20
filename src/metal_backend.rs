@@ -8,7 +8,7 @@
 
 #![cfg(feature = "metal")]
 
-use crate::gpu::{GpuBackend, GpuCompute, GpuDeviceInfo, LayerConfig, LayerTensors};
+use crate::gpu::{GpuBackend, GpuCompute, GpuDeviceInfo, LayerConfig, LayerTensors, PoolingMode};
 use crate::InferError;
 use metal::{
     Buffer, CommandBufferRef, CommandQueue, CompileOptions, ComputePipelineState, Device,
@@ -968,6 +968,47 @@ kernel void softmax_rows(
         for (uint j = tiitg; j < cols; j += tptg) {
             data[row_offset + j] *= inv_sum;
         }
+    }
+}
+
+// Pool final hidden states to one embedding per input.
+// Lane 0 intentionally follows the host pooling/reduction order for parity.
+kernel void pool_rows(
+    device const float* hidden   [[buffer(0)]],
+    device const uint*  masks    [[buffer(1)]],
+    device float*       out      [[buffer(2)]],
+    constant uint& max_len       [[buffer(3)]],
+    constant uint& hidden_size   [[buffer(4)]],
+    constant uint& cls_pooling   [[buffer(5)]],
+    uint batch                   [[threadgroup_position_in_grid]],
+    uint lane                    [[thread_index_in_threadgroup]]
+) {
+    if (lane != 0) {
+        return;
+    }
+    uint base_row = batch * max_len;
+    uint out_base = batch * hidden_size;
+    uint count = 0;
+    if (cls_pooling == 0) {
+        for (uint s = 0; s < max_len; s++) {
+            count += masks[base_row + s] != 0 ? 1 : 0;
+        }
+    }
+    float denom = count > 0 ? float(count) : 1.0;
+
+    for (uint j = 0; j < hidden_size; j++) {
+        float v = 0.0;
+        if (cls_pooling != 0) {
+            v = hidden[base_row * hidden_size + j];
+        } else {
+            for (uint s = 0; s < max_len; s++) {
+                if (masks[base_row + s] != 0) {
+                    v += hidden[(base_row + s) * hidden_size + j];
+                }
+            }
+            v /= denom;
+        }
+        out[out_base + j] = v;
     }
 }
 
@@ -2057,6 +2098,7 @@ impl MetalCompute {
             "scale_mask_alibi",
             "scale_mask_alibi_grouped",
             "softmax_rows",
+            "pool_rows",
             "layer_norm",
             "rms_norm",
             "gelu_activation",
@@ -3913,6 +3955,64 @@ impl GpuCompute for MetalCompute {
             current_hidden.buffer(),
             total_rows * h,
         )))
+    }
+
+    fn forward_layers_batched_pooled(
+        &self,
+        hidden: &[f32],
+        masks: &[u32],
+        layers: &[LayerTensors],
+        config: &LayerConfig,
+        rope_cos: &[f32],
+        rope_sin: &[f32],
+        pooling: PoolingMode,
+    ) -> Result<Option<Vec<f32>>, InferError> {
+        if layers.is_empty() {
+            return Ok(None);
+        }
+        let _span = tracing::info_span!(
+            "kin_infer.metal.forward_layers_batched_pooled",
+            layers = layers.len()
+        )
+        .entered();
+        let h = config.hidden_size;
+        let current_hidden = self.buf_slice_pooled(hidden)?;
+        for weights in layers {
+            self.encode_layer_resident(
+                &current_hidden,
+                masks,
+                weights,
+                config,
+                rope_cos,
+                rope_sin,
+                false,
+            )?;
+        }
+
+        let pooled = self.pool.acquire_uninit(config.batch_size * h * 4)?;
+        let mask_buf = self.buf_u32_slice(masks)?;
+        let buf_max_len = self.buf_u32(config.max_len as u32)?;
+        let buf_h = self.buf_u32(h as u32)?;
+        let buf_cls_pooling = self.buf_u32(matches!(pooling, PoolingMode::Cls) as u32)?;
+
+        let cmd = self.queue.new_command_buffer();
+        let pipeline = &self.pipelines["pool_rows"];
+        let enc = cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pipeline);
+        enc.set_buffer(0, Some(current_hidden.buffer()), 0);
+        enc.set_buffer(1, Some(&mask_buf), 0);
+        enc.set_buffer(2, Some(pooled.buffer()), 0);
+        enc.set_buffer(3, Some(&buf_max_len), 0);
+        enc.set_buffer(4, Some(&buf_h), 0);
+        enc.set_buffer(5, Some(&buf_cls_pooling), 0);
+        let tw = pipeline.thread_execution_width().max(1);
+        let threads = MTLSize::new(config.batch_size as u64 * tw, 1, 1);
+        let tg = MTLSize::new(tw, 1, 1);
+        enc.dispatch_threads(threads, tg);
+        enc.end_encoding();
+        self.commit_wait(cmd);
+
+        Ok(Some(Self::read_buf(pooled.buffer(), config.batch_size * h)))
     }
 
     fn matmul(
