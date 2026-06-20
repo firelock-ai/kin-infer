@@ -4352,12 +4352,9 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(2, Some(&buf_beta), 0);
                 enc.set_buffer(3, Some(&buf_hidden), 0);
                 enc.set_buffer(4, Some(&buf_eps), 0);
-                let tw = ln.thread_execution_width() as u64;
+                let tw = ln.thread_execution_width();
                 let rows_u = rows as u64;
-                enc.dispatch_threads(
-                    MTLSize::new(rows_u * tw, 1, 1),
-                    MTLSize::new(tw, 1, 1),
-                );
+                enc.dispatch_threads(MTLSize::new(rows_u * tw, 1, 1), MTLSize::new(tw, 1, 1));
                 enc.end_encoding();
             }
 
@@ -4475,12 +4472,9 @@ impl GpuCompute for MetalCompute {
                 enc.set_buffer(2, Some(&buf_beta), 0);
                 enc.set_buffer(3, Some(&buf_hidden), 0);
                 enc.set_buffer(4, Some(&buf_eps), 0);
-                let tw = ln.thread_execution_width() as u64;
+                let tw = ln.thread_execution_width();
                 let rows_u = rows as u64;
-                enc.dispatch_threads(
-                    MTLSize::new(rows_u * tw, 1, 1),
-                    MTLSize::new(tw, 1, 1),
-                );
+                enc.dispatch_threads(MTLSize::new(rows_u * tw, 1, 1), MTLSize::new(tw, 1, 1));
                 enc.end_encoding();
             }
 
@@ -4778,7 +4772,7 @@ impl GpuCompute for MetalCompute {
                 let buf_cols = self.buf_u32(seq_len as u32)?;
                 enc.set_buffer(1, Some(&buf_cols), 0);
                 let total_rows = num_heads * seq_len;
-                let tw = p.thread_execution_width() as u64;
+                let tw = p.thread_execution_width();
                 let threads = MTLSize::new((total_rows as u64) * tw, 1, 1);
                 let tg = MTLSize::new(tw, 1, 1);
                 enc.dispatch_threads(threads, tg);
