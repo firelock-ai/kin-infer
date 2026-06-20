@@ -455,7 +455,7 @@ static inline void block_mma(
     device const float* B,
     device float* C,
     uint M, uint N, uint K,
-    uint3 tgid, uint sgid, uint lane,
+    uint3 tgid, uint sgid, uint lane, uint tpsg,
     threadgroup float (*As)[MMA_BK],
     threadgroup float (*Bs)[MMA_BK],
     threadgroup float (*store_tile)[MMA_F][MMA_F])
@@ -468,7 +468,7 @@ static inline void block_mma(
     const uint sn = sgid % WN;           // simdgroup col
     const uint block_row = tgid.y * BM;  // M offset of this block
     const uint block_col = tgid.x * BN;  // N offset of this block
-    const uint tid = sgid * 32u + lane;  // flat thread index 0..127
+    const uint tid = sgid * tpsg + lane;  // flat thread index 0..127
 
     simdgroup_float8x8 acc[TM][TN];
     for (uint i = 0; i < TM; i++)
@@ -534,7 +534,7 @@ static inline void block_mma(
                 threadgroup float* scratch = &store_tile[sgid][0][0];
                 simdgroup_store(acc[i][j], scratch, F, ulong2(0, 0), false);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint e = lane; e < F * F; e += 32u) {
+                for (uint e = lane; e < F * F; e += tpsg) {
                     uint er = e / F, ec = e % F;
                     uint gr = cr + er, gc = cc + ec;
                     if (gr < M && gc < N) {
@@ -557,12 +557,13 @@ kernel void matmul_transb_simdgroup(
     constant uint& K        [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     threadgroup float As[MMA_BM][MMA_BK];
     threadgroup float Bs[MMA_BN][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma<true>(A, B, C, M, N, K, tgid, sgid, lane, As, Bs, store_tile);
+    block_mma<true>(A, B, C, M, N, K, tgid, sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 // Batched QK^T: per head (gid.z) C[h] = Q[h][seq,dim] * K[h][seq,dim]^T.
@@ -576,7 +577,8 @@ kernel void batched_matmul_transb_simdgroup(
     constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     uint kv_h = h / hpg;
@@ -586,7 +588,7 @@ kernel void batched_matmul_transb_simdgroup(
     threadgroup float As[MMA_BM][MMA_BK];
     threadgroup float Bs[MMA_BN][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 // Batched scores*V: per head (gid.z) C[h] = S[h][seq,seq] * V[h][seq,dim].
@@ -600,7 +602,8 @@ kernel void batched_matmul_ab_simdgroup(
     constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     uint kv_h = h / hpg;
@@ -610,7 +613,7 @@ kernel void batched_matmul_ab_simdgroup(
     threadgroup float As[MMA_BM][MMA_BK];
     threadgroup float Bs[MMA_BN][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 // ---- Wider 64x64 MMA tile variants (Lever #5 phase 1) ----
@@ -630,12 +633,13 @@ kernel void matmul_transb_simdgroup_wide(
     constant uint& K        [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     threadgroup float As[64][MMA_BK];
     threadgroup float Bs[64][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma<true, 64, 64>(A, B, C, M, N, K, tgid, sgid, lane, As, Bs, store_tile);
+    block_mma<true, 64, 64>(A, B, C, M, N, K, tgid, sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 kernel void batched_matmul_transb_simdgroup_wide(
@@ -647,7 +651,8 @@ kernel void batched_matmul_transb_simdgroup_wide(
     constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     uint kv_h = h / hpg;
@@ -657,7 +662,7 @@ kernel void batched_matmul_transb_simdgroup_wide(
     threadgroup float As[64][MMA_BK];
     threadgroup float Bs[64][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma<true, 64, 64>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma<true, 64, 64>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 kernel void batched_matmul_ab_simdgroup_wide(
@@ -669,7 +674,8 @@ kernel void batched_matmul_ab_simdgroup_wide(
     constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     uint kv_h = h / hpg;
@@ -679,7 +685,7 @@ kernel void batched_matmul_ab_simdgroup_wide(
     threadgroup float As[64][MMA_BK];
     threadgroup float Bs[64][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma<false, 64, 64>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma<false, 64, 64>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 // ---- Steel double-buffered K-loop MMA (Step 1) ----
@@ -705,7 +711,7 @@ static inline void block_mma_db(
     device const float* B,
     device float* C,
     uint M, uint N, uint K,
-    uint3 tgid, uint sgid, uint lane,
+    uint3 tgid, uint sgid, uint lane, uint tpsg,
     threadgroup float (*As)[32][MMA_BK],      // As[2][32][MMA_BK] ping-pong
     threadgroup float (*Bs)[32][MMA_BK],      // Bs[2][32][MMA_BK] ping-pong
     threadgroup float (*store_tile)[MMA_F][MMA_F])
@@ -718,7 +724,7 @@ static inline void block_mma_db(
     const uint sn = sgid % WN;           // simdgroup col
     const uint block_row = tgid.y * BM;  // M offset of this block
     const uint block_col = tgid.x * BN;  // N offset of this block
-    const uint tid = sgid * 32u + lane;  // flat thread index 0..127
+    const uint tid = sgid * tpsg + lane;  // flat thread index 0..127
 
     simdgroup_float8x8 acc[TM][TN];
     for (uint i = 0; i < TM; i++)
@@ -814,7 +820,7 @@ static inline void block_mma_db(
                 threadgroup float* scratch = &store_tile[sgid][0][0];
                 simdgroup_store(acc[i][j], scratch, F, ulong2(0, 0), false);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint e = lane; e < F * F; e += 32u) {
+                for (uint e = lane; e < F * F; e += tpsg) {
                     uint er = e / F, ec = e % F;
                     uint gr = cr + er, gc = cc + ec;
                     if (gr < M && gc < N) {
@@ -837,12 +843,13 @@ kernel void matmul_transb_simdgroup_steel(
     constant uint& K        [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     threadgroup float As[2][32][MMA_BK];
     threadgroup float Bs[2][32][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma_db<true>(A, B, C, M, N, K, tgid, sgid, lane, As, Bs, store_tile);
+    block_mma_db<true>(A, B, C, M, N, K, tgid, sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 // Batched QK^T per head, double-buffered (see batched_matmul_transb_simdgroup).
@@ -855,7 +862,8 @@ kernel void batched_matmul_transb_simdgroup_steel(
     constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     uint kv_h = h / hpg;
@@ -865,7 +873,7 @@ kernel void batched_matmul_transb_simdgroup_steel(
     threadgroup float As[2][32][MMA_BK];
     threadgroup float Bs[2][32][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma_db<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma_db<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 // Batched scores*V per head, double-buffered (see batched_matmul_ab_simdgroup).
@@ -878,7 +886,8 @@ kernel void batched_matmul_ab_simdgroup_steel(
     constant uint& hpg      [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     uint kv_h = h / hpg;
@@ -888,7 +897,7 @@ kernel void batched_matmul_ab_simdgroup_steel(
     threadgroup float As[2][32][MMA_BK];
     threadgroup float Bs[2][32][MMA_BK];
     threadgroup float store_tile[MMA_WM * MMA_WN][MMA_F][MMA_F];
-    block_mma_db<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma_db<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 // ---- Softmax over rows (SIMD-reduced) ----
@@ -1501,7 +1510,7 @@ static inline void block_mma_fp16(
     device const float* B,
     device float* C,
     uint M, uint N, uint K,
-    uint3 tgid, uint sgid, uint lane,
+    uint3 tgid, uint sgid, uint lane, uint tpsg,
     threadgroup half (*As)[MMA_BK],
     threadgroup half (*Bs)[MMA_BK],
     threadgroup float (*store_tile)[MMA_F][MMA_F])
@@ -1514,7 +1523,7 @@ static inline void block_mma_fp16(
     const uint sn = sgid % WN;
     const uint block_row = tgid.y * BM;
     const uint block_col = tgid.x * BN;
-    const uint tid = sgid * 32u + lane;
+    const uint tid = sgid * tpsg + lane;
 
     // fp32 accumulator — the parity invariant. Do NOT switch to half.
     simdgroup_float8x8 acc[TM][TN];
@@ -1571,7 +1580,7 @@ static inline void block_mma_fp16(
                 threadgroup float* scratch = &store_tile[sgid][0][0];
                 simdgroup_store(acc[i][j], scratch, F, ulong2(0, 0), false);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (uint e = lane; e < F * F; e += 32u) {
+                for (uint e = lane; e < F * F; e += tpsg) {
                     uint er = e / F, ec = e % F;
                     uint gr = cr + er, gc = cc + ec;
                     if (gr < M && gc < N) {
@@ -1593,12 +1602,13 @@ kernel void matmul_transb_simdgroup_fp16(
     constant uint& K        [[buffer(5)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     threadgroup half As[32][MMA_BK];
     threadgroup half Bs[32][MMA_BK];
     threadgroup float store_tile[2 * 2][MMA_F][MMA_F];
-    block_mma_fp16<true>(A, B, C, M, N, K, tgid, sgid, lane, As, Bs, store_tile);
+    block_mma_fp16<true>(A, B, C, M, N, K, tgid, sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 kernel void batched_matmul_transb_simdgroup_fp16(
@@ -1609,7 +1619,8 @@ kernel void batched_matmul_transb_simdgroup_fp16(
     constant uint& dim      [[buffer(4)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     device const float* Ah = Q  + h * seq * dim;
@@ -1618,7 +1629,7 @@ kernel void batched_matmul_transb_simdgroup_fp16(
     threadgroup half As[32][MMA_BK];
     threadgroup half Bs[32][MMA_BK];
     threadgroup float store_tile[2 * 2][MMA_F][MMA_F];
-    block_mma_fp16<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma_fp16<true>(Ah, Bh, Ch, seq, seq, dim, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 
 kernel void batched_matmul_ab_simdgroup_fp16(
@@ -1629,7 +1640,8 @@ kernel void batched_matmul_ab_simdgroup_fp16(
     constant uint& dim      [[buffer(4)]],
     uint3 tgid              [[threadgroup_position_in_grid]],
     uint  sgid             [[simdgroup_index_in_threadgroup]],
-    uint  lane             [[thread_index_in_simdgroup]])
+    uint  lane             [[thread_index_in_simdgroup]],
+    uint  tpsg             [[threads_per_simdgroup]])
 {
     uint h = tgid.z;
     device const float* Ah = S + h * seq * seq;
@@ -1638,7 +1650,7 @@ kernel void batched_matmul_ab_simdgroup_fp16(
     threadgroup half As[32][MMA_BK];
     threadgroup half Bs[32][MMA_BK];
     threadgroup float store_tile[2 * 2][MMA_F][MMA_F];
-    block_mma_fp16<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, As, Bs, store_tile);
+    block_mma_fp16<false>(Ah, Bh, Ch, seq, dim, seq, uint3(tgid.x, tgid.y, 0), sgid, lane, tpsg, As, Bs, store_tile);
 }
 "#;
 
