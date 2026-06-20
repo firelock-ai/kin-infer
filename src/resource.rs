@@ -361,13 +361,24 @@ fn unified_throughput_scale(system_total_bytes: Option<u64>) -> usize {
 }
 
 /// In-flight Metal command-buffer depth for unified-memory throughput, scaled by
-/// memory tier so larger parts pipeline more work without starving submission.
+/// memory tier. Depth hides host-submission latency behind GPU execution and
+/// only costs ~depth× a layer's resident working set (it does not lengthen any
+/// kernel, so the GPU watchdog is unaffected). Large-unified parts can therefore
+/// pipeline deeper; the explicit `KIN_INFER_MAX_INFLIGHT` override probes higher.
 fn unified_inflight(system_total_bytes: Option<u64>) -> usize {
     match system_total_bytes {
-        Some(b) if b >= 96 * GIB => 4,
+        Some(b) if b >= 96 * GIB => 6,
+        Some(b) if b >= 64 * GIB => 4,
         Some(b) if b >= 32 * GIB => 3,
         _ => 2,
     }
+}
+
+/// Parse an explicit in-flight command-buffer override (`KIN_INFER_MAX_INFLIGHT`).
+/// `Some(n)` only for a value that parses to `n >= 1`; otherwise `None`.
+pub(crate) fn inflight_override_value(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|r| r.trim().parse::<usize>().ok())
+        .filter(|n| *n >= 1)
 }
 
 impl ResourcePlan {
@@ -378,6 +389,14 @@ impl ResourcePlan {
         let memory = detect_memory();
         let mut plan = ResourcePlan::for_profile(profile, &host, &accelerator, &memory);
         plan.gpu_core_count = detect_gpu_cores();
+        // Reflect an explicit in-flight override so `kin resources inspect` reports
+        // the depth the runtime will actually use (the Metal backend honors the
+        // same override).
+        if let Some(n) =
+            inflight_override_value(std::env::var("KIN_INFER_MAX_INFLIGHT").ok().as_deref())
+        {
+            plan.accelerator.max_inflight_command_buffers = n;
+        }
         plan
     }
 
@@ -626,7 +645,7 @@ mod tests {
         // 128 GiB unified -> top tier (4x) over the historical 8.38M / 65536 base.
         assert_eq!(plan.embedding.max_attention_area, Some(33_554_432));
         assert_eq!(plan.embedding.max_batch_tokens, 262_144);
-        assert_eq!(plan.accelerator.max_inflight_command_buffers, 4);
+        assert_eq!(plan.accelerator.max_inflight_command_buffers, 6);
         assert_eq!(plan.embedding.max_entities_per_graph_chunk, 512);
         assert_eq!(plan.embedding.hybrid_mode, HybridMode::Balanced);
         assert_eq!(plan.host.rayon_threads, 17);
@@ -648,7 +667,7 @@ mod tests {
         );
         assert_eq!(plan.embedding.max_attention_area, Some(25_165_824));
         assert_eq!(plan.embedding.max_batch_tokens, 196_608);
-        assert_eq!(plan.accelerator.max_inflight_command_buffers, 3);
+        assert_eq!(plan.accelerator.max_inflight_command_buffers, 4);
 
         let plan = ResourcePlan::for_profile(
             Profile::Throughput,
@@ -659,6 +678,16 @@ mod tests {
         assert_eq!(plan.embedding.max_attention_area, Some(16_777_216));
         assert_eq!(plan.embedding.max_batch_tokens, 131_072);
         assert_eq!(plan.accelerator.max_inflight_command_buffers, 3);
+    }
+
+    #[test]
+    fn inflight_override_value_parses_positive_only() {
+        assert_eq!(inflight_override_value(Some("8")), Some(8));
+        assert_eq!(inflight_override_value(Some(" 12 ")), Some(12));
+        assert_eq!(inflight_override_value(Some("0")), None);
+        assert_eq!(inflight_override_value(Some("-1")), None);
+        assert_eq!(inflight_override_value(Some("x")), None);
+        assert_eq!(inflight_override_value(None), None);
     }
 
     #[test]

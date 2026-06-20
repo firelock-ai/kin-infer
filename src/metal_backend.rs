@@ -1693,11 +1693,8 @@ fn resolve_max_inflight() -> u32 {
 /// Pure core of [`resolve_max_inflight`]: explicit override (≥ 1) wins, else the
 /// named profile's accelerator depth, else [`DEFAULT_MAX_INFLIGHT`].
 fn resolve_max_inflight_inner(override_raw: Option<&str>, profile_raw: Option<&str>) -> u32 {
-    if let Some(n) = override_raw
-        .and_then(|raw| raw.trim().parse::<u32>().ok())
-        .filter(|n| *n >= 1)
-    {
-        return n;
+    if let Some(n) = crate::resource::inflight_override_value(override_raw) {
+        return n as u32;
     }
     let profile = profile_raw.and_then(|raw| match raw.trim().to_ascii_lowercase().as_str() {
         "proof" => Some(crate::resource::Profile::Proof),
@@ -2193,6 +2190,11 @@ impl MetalCompute {
         FP16_MMA_AVAILABLE.store(fp16_mma_available, Ordering::Relaxed);
 
         let pool = Arc::new(BufferPool::new(device.clone()));
+        let max_inflight = resolve_max_inflight();
+        tracing::info!(
+            max_inflight,
+            "kin_infer.metal: in-flight command-buffer depth resolved"
+        );
         Some(Self {
             device,
             queue,
@@ -2201,7 +2203,7 @@ impl MetalCompute {
             weight_cache: Mutex::new(HashMap::new()),
             concat_cache: Mutex::new(HashMap::new()),
             inflight: Arc::new((Mutex::new(0), Condvar::new())),
-            max_inflight: resolve_max_inflight(),
+            max_inflight,
             pool,
         })
     }
