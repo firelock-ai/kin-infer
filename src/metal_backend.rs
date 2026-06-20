@@ -2322,7 +2322,7 @@ impl MetalCompute {
     #[inline]
     #[allow(dead_code)]
     fn count_nonfinite(name: &str, data: &[f32]) -> usize {
-        if std::env::var_os("KIN_INFER_METAL_NAN_CHECK").is_none() {
+        if !Self::metal_nan_check_enabled() {
             return 0;
         }
         let n = data.iter().filter(|x| !x.is_finite()).count();
@@ -2334,6 +2334,17 @@ impl MetalCompute {
             );
         }
         n
+    }
+
+    #[inline]
+    fn metal_nan_check_enabled() -> bool {
+        std::env::var_os("KIN_INFER_METAL_NAN_CHECK").is_some()
+    }
+
+    fn readback_count_nonfinite(name: &str, buf: &Buffer, count: usize) {
+        let mut data = vec![0.0; count];
+        Self::read_buf_into(buf, &mut data);
+        Self::count_nonfinite(name, &data);
     }
 
     /// Read floats from a shared buffer in-place into a mutable slice. Timed into
@@ -3109,7 +3120,7 @@ impl MetalCompute {
             // ---------------------------------------------------------
             // Command Buffer 2: RoPE + Fused Attention Posmajor + Attn Out Projection + Add Residual
             // ---------------------------------------------------------
-            let cmd2 = self.queue.new_command_buffer();
+            let mut cmd2 = self.queue.new_command_buffer();
             let mut retains2 = Vec::new();
 
             // Only apply RoPE if cos/sin are provided
@@ -3221,6 +3232,8 @@ impl MetalCompute {
             let buf_has_alibi = self.buf_u32(0)?;
             let buf_alibi = self.buf_slice_pooled(&[0.0f32])?;
             let buf_out_reshaped = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
+            let nan_check = Self::metal_nan_check_enabled();
+            let score_len = total_q_heads * max_len * max_len;
 
             let qk_bufs = [
                 buf_q_reshaped.buffer(),
@@ -3251,11 +3264,15 @@ impl MetalCompute {
                 );
             }
 
-            self.commit_wait(cmd2);
-            let mut out_scores = vec![0.0; total_q_heads * max_len * max_len];
-            Self::read_buf_into(buf_scores.buffer(), &mut out_scores);
-            Self::count_nonfinite("after batched_matmul_transb", &out_scores);
-            let cmd2 = self.queue.new_command_buffer();
+            if nan_check {
+                self.commit_wait(cmd2);
+                Self::readback_count_nonfinite(
+                    "after batched_matmul_transb",
+                    buf_scores.buffer(),
+                    score_len,
+                );
+                cmd2 = self.queue.new_command_buffer();
+            }
 
             self.encode_3d(
                 cmd2,
@@ -3274,13 +3291,15 @@ impl MetalCompute {
                 total_q_heads,
             );
 
-            self.commit_wait(cmd2);
-
-            let mut out_scores = vec![0.0; total_q_heads * max_len * max_len];
-            Self::read_buf_into(buf_scores.buffer(), &mut out_scores);
-            Self::count_nonfinite("after scale_mask_alibi_grouped", &out_scores);
-
-            let cmd2 = self.queue.new_command_buffer();
+            if nan_check {
+                self.commit_wait(cmd2);
+                Self::readback_count_nonfinite(
+                    "after scale_mask_alibi_grouped",
+                    buf_scores.buffer(),
+                    score_len,
+                );
+                cmd2 = self.queue.new_command_buffer();
+            }
 
             self.encode_rows_simdgroup(
                 cmd2,
@@ -3289,10 +3308,15 @@ impl MetalCompute {
                 total_q_heads * max_len,
             );
 
-            self.commit_wait(cmd2);
-            Self::read_buf_into(buf_scores.buffer(), &mut out_scores);
-            Self::count_nonfinite("after softmax_rows", &out_scores);
-            let cmd2 = self.queue.new_command_buffer();
+            if nan_check {
+                self.commit_wait(cmd2);
+                Self::readback_count_nonfinite(
+                    "after softmax_rows",
+                    buf_scores.buffer(),
+                    score_len,
+                );
+                cmd2 = self.queue.new_command_buffer();
+            }
 
             let sv_bufs = [
                 buf_scores.buffer(),
@@ -4025,14 +4049,20 @@ impl GpuCompute for MetalCompute {
         )
         .entered();
         let buf = self.buf_slice_pooled(data)?;
-        let buf_gamma = self.buf_cached(gamma)?;
-        let buf_beta = self.buf_cached(beta)?;
+        let buf_gamma = self.buf_slice_pooled(gamma)?;
+        let buf_beta = self.buf_slice_pooled(beta)?;
         let buf_cols = self.buf_u32(cols as u32)?;
         let buf_eps = self.buf_f32(eps)?;
         time_phase(Phase::Norm, || {
             self.dispatch_rows_simdgroup(
                 "layer_norm",
-                &[buf.buffer(), &buf_gamma, &buf_beta, &buf_cols, &buf_eps],
+                &[
+                    buf.buffer(),
+                    buf_gamma.buffer(),
+                    buf_beta.buffer(),
+                    &buf_cols,
+                    &buf_eps,
+                ],
                 rows,
             )
         });
@@ -4057,13 +4087,13 @@ impl GpuCompute for MetalCompute {
         )
         .entered();
         let buf = self.buf_slice_pooled(data)?;
-        let buf_weight = self.buf_cached(weight)?;
+        let buf_weight = self.buf_slice_pooled(weight)?;
         let buf_cols = self.buf_u32(cols as u32)?;
         let buf_eps = self.buf_f32(eps)?;
         time_phase(Phase::Norm, || {
             self.dispatch_rows_simdgroup(
                 "rms_norm",
-                &[buf.buffer(), &buf_weight, &buf_cols, &buf_eps],
+                &[buf.buffer(), buf_weight.buffer(), &buf_cols, &buf_eps],
                 rows,
             )
         });
