@@ -257,6 +257,26 @@ fn use_fp16_mma(m: usize, n: usize, k: usize) -> bool {
     mma_fp16_enabled() && FP16_MMA_AVAILABLE.load(Ordering::Relaxed) && use_mma(m, n, k)
 }
 
+/// Whether the C7 flash-attention path is selected. Default OFF: selected only
+/// by the resource plan or `KIN_INFER_FLASH_ATTENTION=1`, and currently used
+/// solely to attempt optional pipeline registration during Metal construction.
+/// No runtime attention dispatch is routed through C7 until kernels are added
+/// and parity-cleared.
+fn c7_flash_attention_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        crate::resource::env_flag_override("KIN_INFER_FLASH_ATTENTION")
+            .unwrap_or_else(|| crate::resource::active_gpu_kernel_plan().flash_attention)
+    })
+}
+
+/// Whether the optional C7 flash-attention pipelines compiled on this device.
+/// Defaults false so the baseline Metal attention path stays authoritative when
+/// C7 is disabled, absent, or rejected by the Metal toolchain.
+static C7_FLASH_ATTENTION_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Whether the steel double-buffered K-loop MMA path is selected. The steel
 /// kernels overlap the next K-tile's global load with the current tile's MMA
 /// (2-stage software pipeline) but are numerically IDENTICAL to the single-buffer
@@ -1645,6 +1665,21 @@ kernel void batched_matmul_ab_simdgroup_fp16(
 "#;
 
 // ---------------------------------------------------------------------------
+// C7 flash-attention — SEPARATE shader library skeleton
+// ---------------------------------------------------------------------------
+// Kept separate from the baseline Metal shader library for the same reason as
+// the fp16 MMA library: an experimental C7 compile/pipeline failure must only
+// disable C7, never Metal itself. The kernel list intentionally starts empty;
+// adding a real C7 shader later is a small registration change instead of a
+// control-flow change.
+const C7_FLASH_ATTENTION_SHADER_SOURCE: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+"#;
+
+const C7_FLASH_ATTENTION_KERNEL_NAMES: &[&str] = &[];
+
+// ---------------------------------------------------------------------------
 // Bounded in-flight submission
 // ---------------------------------------------------------------------------
 //
@@ -2181,6 +2216,55 @@ impl MetalCompute {
             }
         }
         FP16_MMA_AVAILABLE.store(fp16_mma_available, Ordering::Relaxed);
+
+        // C7 flash-attention — OPTIONAL, compiled as a SEPARATE library only
+        // when opt-in enabled. The skeleton currently registers no kernels, so
+        // C7 availability remains false and all runtime attention calls continue
+        // through the baseline Metal path. Future C7 kernels can be added to
+        // C7_FLASH_ATTENTION_KERNEL_NAMES without making the main library depend
+        // on them.
+        let mut c7_flash_attention_available = false;
+        if c7_flash_attention_enabled() {
+            match device.new_library_with_source(C7_FLASH_ATTENTION_SHADER_SOURCE, &opts) {
+                Ok(c7_library) => {
+                    if C7_FLASH_ATTENTION_KERNEL_NAMES.is_empty() {
+                        eprintln!(
+                            "kin-infer: Metal C7 flash-attention requested, but no C7 \
+                             kernels are registered yet; baseline attention stays enabled"
+                        );
+                    } else {
+                        let mut ok = true;
+                        for &name in C7_FLASH_ATTENTION_KERNEL_NAMES {
+                            let pipeline = c7_library.get_function(name, None).and_then(|func| {
+                                device.new_compute_pipeline_state_with_function(&func)
+                            });
+                            match pipeline {
+                                Ok(pipeline) => {
+                                    pipelines.insert(name, pipeline);
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "kin-infer: Metal C7 flash-attention kernel {name} \
+                                         unavailable ({err}); C7 disabled (baseline \
+                                         attention stays enabled)"
+                                    );
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        c7_flash_attention_available = ok;
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "kin-infer: Metal C7 flash-attention shader library failed to \
+                         compile ({err}); C7 disabled (baseline attention stays enabled)"
+                    );
+                }
+            }
+        }
+        C7_FLASH_ATTENTION_AVAILABLE.store(c7_flash_attention_available, Ordering::Relaxed);
 
         let pool = Arc::new(BufferPool::new(device.clone()));
         Some(Self {
@@ -6301,7 +6385,7 @@ mod tests {
         let many = metal
             .matmul_many(&a, &[&b0, &b1, &b2], m, &[n, n, n], k)
             .unwrap();
-        let single = vec![
+        let single = [
             metal.matmul(&a, &b0, m, n, k).unwrap(),
             metal.matmul(&a, &b1, m, n, k).unwrap(),
             metal.matmul(&a, &b2, m, n, k).unwrap(),
