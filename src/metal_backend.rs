@@ -897,20 +897,21 @@ kernel void softmax_rows(
     device float* data          [[buffer(0)]],
     constant uint& cols         [[buffer(1)]],
     uint tgid                   [[threadgroup_position_in_grid]],
-    uint tiitg                  [[thread_index_in_threadgroup]]
+    uint tiitg                  [[thread_index_in_threadgroup]],
+    uint tptg                   [[threads_per_threadgroup]]
 ) {
     uint row_offset = tgid * cols;
 
     // Find max
     float max_val = -INFINITY;
-    for (uint j = tiitg; j < cols; j += 32) {
+    for (uint j = tiitg; j < cols; j += tptg) {
         max_val = max(max_val, data[row_offset + j]);
     }
     max_val = simd_max(max_val);
 
     // Exp and sum
     float sum = 0.0;
-    for (uint j = tiitg; j < cols; j += 32) {
+    for (uint j = tiitg; j < cols; j += tptg) {
         float v = exp(data[row_offset + j] - max_val);
         data[row_offset + j] = v;
         sum += v;
@@ -920,7 +921,7 @@ kernel void softmax_rows(
     // Normalize
     if (sum > 0.0) {
         float inv_sum = 1.0 / sum;
-        for (uint j = tiitg; j < cols; j += 32) {
+        for (uint j = tiitg; j < cols; j += tptg) {
             data[row_offset + j] *= inv_sum;
         }
     }
@@ -935,26 +936,27 @@ kernel void layer_norm(
     constant uint& cols         [[buffer(3)]],
     constant float& eps         [[buffer(4)]],
     uint tgid                   [[threadgroup_position_in_grid]],
-    uint tiitg                  [[thread_index_in_threadgroup]]
+    uint tiitg                  [[thread_index_in_threadgroup]],
+    uint tptg                   [[threads_per_threadgroup]]
 ) {
     uint off = tgid * cols;
     float len = float(cols);
 
     // Mean
     float local_sum = 0.0;
-    for (uint j = tiitg; j < cols; j += 32) local_sum += data[off + j];
+    for (uint j = tiitg; j < cols; j += tptg) local_sum += data[off + j];
     float mean = simd_sum(local_sum) / len;
 
     // Variance
     float local_var = 0.0;
-    for (uint j = tiitg; j < cols; j += 32) {
+    for (uint j = tiitg; j < cols; j += tptg) {
         float d = data[off + j] - mean;
         local_var += d * d;
     }
     float var = simd_sum(local_var) / len;
 
     float inv_std = rsqrt(var + eps);
-    for (uint j = tiitg; j < cols; j += 32) {
+    for (uint j = tiitg; j < cols; j += tptg) {
         data[off + j] = (data[off + j] - mean) * inv_std * gamma[j] + beta[j];
     }
 }
@@ -967,20 +969,21 @@ kernel void rms_norm(
     constant uint& cols         [[buffer(2)]],
     constant float& eps         [[buffer(3)]],
     uint tgid                   [[threadgroup_position_in_grid]],
-    uint tiitg                  [[thread_index_in_threadgroup]]
+    uint tiitg                  [[thread_index_in_threadgroup]],
+    uint tptg                   [[threads_per_threadgroup]]
 ) {
     uint off = tgid * cols;
     float len = float(cols);
 
     float local_sq_sum = 0.0;
-    for (uint j = tiitg; j < cols; j += 32) {
+    for (uint j = tiitg; j < cols; j += tptg) {
         float v = data[off + j];
         local_sq_sum += v * v;
     }
     float sq_sum = simd_sum(local_sq_sum);
     float inv_rms = rsqrt(sq_sum / len + eps);
 
-    for (uint j = tiitg; j < cols; j += 32) {
+    for (uint j = tiitg; j < cols; j += tptg) {
         data[off + j] = data[off + j] * inv_rms * weight[j];
     }
 }
@@ -5430,7 +5433,7 @@ mod tests {
             .layer_norm(&mut data, &gamma, &beta, 1, 4, 1e-5)
             .unwrap();
         let mean: f32 = data.iter().sum::<f32>() / 4.0;
-        println!("Output data: {:?}", data);
+
         assert!(mean.abs() < 1e-3, "mean={}", mean);
     }
 
