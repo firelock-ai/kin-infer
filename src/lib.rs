@@ -1322,6 +1322,8 @@ impl BertModel {
         )
         .entered();
         let mut results = Vec::with_capacity(batch_size);
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        crate::metal_backend::record_forward_calls(batch_size);
 
         for b in 0..batch_size {
             let ids = &token_ids[b];
@@ -2128,6 +2130,8 @@ impl BertModel {
         if bucket_enabled() {
             return self.forward_batched_bucketed(token_ids, attention_masks);
         }
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        crate::metal_backend::record_forward_calls(1);
 
         let (hidden, masks, max_len) = self.encode_batched(token_ids, attention_masks)?;
 
@@ -2214,6 +2218,8 @@ impl BertModel {
             groups = groups.len()
         )
         .entered();
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        crate::metal_backend::record_forward_calls(groups.len());
 
         // One empty slot per input; every index lands in exactly one group and
         // every group writes its results back, so all slots are filled.

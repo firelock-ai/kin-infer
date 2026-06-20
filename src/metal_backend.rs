@@ -25,16 +25,15 @@ use std::sync::Arc;
 // ---------------------------------------------------------------------------
 //
 // When `KIN_INFER_METAL_PROFILE` is set, `commit_bounded` bumps a submission
-// counter on every commit and accumulates the wall-clock the host actually
-// spends PARKED on the in-flight backpressure condvar into the host-stall
-// accumulator. Because commits no longer block on `wait_until_completed`, the
-// measured stall reflects real backpressure (the host waiting for an in-flight
-// slot) rather than every round-trip, so a benchmark can report the stall-vs-
-// kernel split and the number of GPU submissions per forward pass. Reads via a
-// relaxed atomic; the env var is sampled once per process.
+// counter on every commit and accumulates the wall-clock the host spends PARKED
+// on the in-flight backpressure condvar. `commit_wait` adds the explicit
+// `wait_until_completed` boundary, so benchmarks can report both command-buffer
+// count and host-blocked time while we collapse per-op round-trips.
 
 static STALL_NANOS: AtomicU64 = AtomicU64::new(0);
 static SUBMISSIONS: AtomicU64 = AtomicU64::new(0);
+static ROUND_TRIPS: AtomicU64 = AtomicU64::new(0);
+static FORWARD_CALLS: AtomicU64 = AtomicU64::new(0);
 
 // Per-phase wall-clock accumulators (ns), bucketed by kernel class so a forward
 // pass reports where the time actually goes — matmul vs attention vs norm/softmax
@@ -310,15 +309,39 @@ fn use_steel(m: usize, n: usize, k: usize) -> bool {
     steel_enabled() && STEEL_MMA_AVAILABLE.load(Ordering::Relaxed) && use_mma(m, n, k)
 }
 
-/// Total nanoseconds the host spent blocked in `wait_until_completed` since the
-/// last `reset_profile`. Only meaningful when `KIN_INFER_METAL_PROFILE` is set.
+/// Total nanoseconds the host spent blocked by Metal submission backpressure or
+/// explicit `wait_until_completed` calls since the last `reset_profile`. Only
+/// meaningful when `KIN_INFER_METAL_PROFILE` is set.
 pub fn profile_stall_nanos() -> u64 {
     STALL_NANOS.load(Ordering::Relaxed)
 }
 
-/// Number of GPU command-buffer submissions (commit+wait) since the last reset.
+/// Alias for the total host-blocked time reported by FIR-1128 profile output.
+pub fn profile_host_blocked_nanos() -> u64 {
+    STALL_NANOS.load(Ordering::Relaxed)
+}
+
+/// Number of GPU command-buffer submissions since the last reset.
 pub fn profile_submissions() -> u64 {
     SUBMISSIONS.load(Ordering::Relaxed)
+}
+
+/// Number of blocking host↔GPU completion waits since the last reset.
+pub fn profile_round_trips() -> u64 {
+    ROUND_TRIPS.load(Ordering::Relaxed)
+}
+
+/// Number of model forward boundaries since the last reset.
+pub fn profile_forward_calls() -> u64 {
+    FORWARD_CALLS.load(Ordering::Relaxed)
+}
+
+/// Record model forward boundaries so profile output can normalize round-trips
+/// and host-blocked time per forward without inferring from corpus size.
+pub fn record_forward_calls(count: usize) {
+    if count > 0 && profile_enabled() {
+        FORWARD_CALLS.fetch_add(count as u64, Ordering::Relaxed);
+    }
 }
 
 /// Per-phase wall-clock breakdown (ns) since the last reset, as
@@ -358,6 +381,8 @@ pub fn profile_gpu_phase_nanos() -> Vec<(&'static str, u64)> {
 pub fn reset_profile() {
     STALL_NANOS.store(0, Ordering::Relaxed);
     SUBMISSIONS.store(0, Ordering::Relaxed);
+    ROUND_TRIPS.store(0, Ordering::Relaxed);
+    FORWARD_CALLS.store(0, Ordering::Relaxed);
     MATMUL_NANOS.store(0, Ordering::Relaxed);
     ATTENTION_NANOS.store(0, Ordering::Relaxed);
     NORM_NANOS.store(0, Ordering::Relaxed);
@@ -2523,8 +2548,13 @@ impl MetalCompute {
     #[inline]
     fn commit_wait(&self, cmd: &CommandBufferRef) {
         self.commit_bounded(cmd, Vec::new());
+        let blocked_start = profile_enabled().then(std::time::Instant::now);
+        if blocked_start.is_some() {
+            ROUND_TRIPS.fetch_add(1, Ordering::Relaxed);
+        }
         cmd.wait_until_completed();
-        if profile_enabled() {
+        if let Some(start) = blocked_start {
+            STALL_NANOS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
             if let Some(phase) = CURRENT_PHASE.with(|p| p.get()) {
                 phase
                     .gpu_counter()
@@ -2867,7 +2897,7 @@ fn steel_mma_name(base: &str) -> &str {
 }
 
 impl MetalCompute {
-    /// Encode one transformer layer's three command buffers against the resident
+    /// Encode one transformer layer against the resident
     /// `current_hidden` residual buffer. Does not upload the input or read the
     /// output back: the caller owns `current_hidden` and keeps it on-device across
     /// layers. Only the final layer (`is_last`) blocks the host; earlier layers
@@ -2907,10 +2937,11 @@ impl MetalCompute {
             let kv_dim = kv_heads * head_dim;
 
             // ---------------------------------------------------------
-            // Command Buffer 1: Norm 1 + QKV Projections
+            // Single production command buffer for the full layer. Diagnostic
+            // NaN readbacks below intentionally split it only when enabled.
             // ---------------------------------------------------------
-            let cmd1 = self.queue.new_command_buffer();
-            let mut retains1 = Vec::new();
+            let mut cmd = self.queue.new_command_buffer();
+            let mut retains = Vec::new();
 
             let buf_rows = self.buf_u32(total_rows as u32)?;
             let buf_h = self.buf_u32(h as u32)?;
@@ -2926,7 +2957,7 @@ impl MetalCompute {
             if config.pre_ln {
                 let buf = self.pool.acquire_uninit(total_rows * h * 4)?;
                 {
-                    let blit = cmd1.new_blit_command_encoder();
+                    let blit = cmd.new_blit_command_encoder();
                     blit.copy_from_buffer(
                         current_hidden.buffer(),
                         0,
@@ -2939,7 +2970,7 @@ impl MetalCompute {
                 let buf_norm1_w = self.buf_cached(weights.norm1_weight)?;
                 if config.use_rms {
                     self.encode_rows_simdgroup(
-                        cmd1,
+                        cmd,
                         "rms_norm",
                         &[buf.buffer(), &buf_norm1_w, &buf_h, &buf_eps],
                         total_rows,
@@ -2947,7 +2978,7 @@ impl MetalCompute {
                 } else {
                     let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]))?;
                     self.encode_rows_simdgroup(
-                        cmd1,
+                        cmd,
                         "layer_norm",
                         &[buf.buffer(), &buf_norm1_w, &buf_norm1_b, &buf_h, &buf_eps],
                         total_rows,
@@ -2974,7 +3005,7 @@ impl MetalCompute {
 
                 if use_mma(total_rows, total_qkv, h) {
                     self.encode_mma(
-                        cmd1,
+                        cmd,
                         "matmul_transb_simdgroup",
                         &[
                             qkv_in,
@@ -2991,7 +3022,7 @@ impl MetalCompute {
                     );
                 } else {
                     Self::encode_matmul(
-                        cmd1,
+                        cmd,
                         &self.pipelines["matmul_transb"],
                         qkv_in,
                         &buf_qkv_w,
@@ -3007,7 +3038,7 @@ impl MetalCompute {
                 if let Some(qkv_bias) = weights.qkv_bias {
                     let b_bias = self.buf_cached(qkv_bias)?;
                     self.encode_1d(
-                        cmd1,
+                        cmd,
                         "elementwise_add_broadcast",
                         &[buf_qkv.buffer(), &b_bias, &buf_qkv_dim],
                         total_rows * total_qkv,
@@ -3015,7 +3046,7 @@ impl MetalCompute {
                 }
 
                 let split_p = &self.pipelines["split_qkv_packed"];
-                let enc = cmd1.new_compute_command_encoder();
+                let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(split_p);
                 enc.set_buffer(0, Some(buf_qkv.buffer()), 0);
                 enc.set_buffer(1, Some(buf_q.buffer()), 0);
@@ -3038,7 +3069,7 @@ impl MetalCompute {
                     let q_ln_w_buf = self.buf_cached(q_ln_w)?;
                     let q_ln_b_buf = self.buf_cached(weights.q_ln_bias.unwrap_or(&[]))?;
                     self.encode_rows_simdgroup(
-                        cmd1,
+                        cmd,
                         "layer_norm",
                         &[
                             buf_q.buffer(),
@@ -3054,7 +3085,7 @@ impl MetalCompute {
                     let k_ln_w_buf = self.buf_cached(k_ln_w)?;
                     let k_ln_b_buf = self.buf_cached(weights.k_ln_bias.unwrap_or(&[]))?;
                     self.encode_rows_simdgroup(
-                        cmd1,
+                        cmd,
                         "layer_norm",
                         &[
                             buf_k.buffer(),
@@ -3066,7 +3097,7 @@ impl MetalCompute {
                         total_rows,
                     );
                 }
-                retains1.push(buf_qkv);
+                retains.push(buf_qkv);
             } else {
                 let buf_qw = self.buf_cached(weights.q_weight.ok_or_else(|| {
                     InferError::ModelIncompatible("attention requires q_weight".into())
@@ -3079,7 +3110,7 @@ impl MetalCompute {
                 })?)?;
                 if use_mma(total_rows, q_dim, h) {
                     self.encode_mma(
-                        cmd1,
+                        cmd,
                         "matmul_transb_simdgroup",
                         &[
                             qkv_in,
@@ -3096,7 +3127,7 @@ impl MetalCompute {
                     );
                 } else {
                     Self::encode_matmul(
-                        cmd1,
+                        cmd,
                         &self.pipelines["matmul_transb"],
                         qkv_in,
                         &buf_qw,
@@ -3110,7 +3141,7 @@ impl MetalCompute {
                 }
                 if use_mma(total_rows, kv_dim, h) {
                     self.encode_mma(
-                        cmd1,
+                        cmd,
                         "matmul_transb_simdgroup",
                         &[
                             qkv_in,
@@ -3126,7 +3157,7 @@ impl MetalCompute {
                         1,
                     );
                     self.encode_mma(
-                        cmd1,
+                        cmd,
                         "matmul_transb_simdgroup",
                         &[
                             qkv_in,
@@ -3143,7 +3174,7 @@ impl MetalCompute {
                     );
                 } else {
                     Self::encode_matmul(
-                        cmd1,
+                        cmd,
                         &self.pipelines["matmul_transb"],
                         qkv_in,
                         &buf_kw,
@@ -3155,7 +3186,7 @@ impl MetalCompute {
                         total_rows,
                     );
                     Self::encode_matmul(
-                        cmd1,
+                        cmd,
                         &self.pipelines["matmul_transb"],
                         qkv_in,
                         &buf_vw,
@@ -3170,7 +3201,7 @@ impl MetalCompute {
                 if let Some(q_bias) = weights.q_bias {
                     let b = self.buf_cached(q_bias)?;
                     self.encode_1d(
-                        cmd1,
+                        cmd,
                         "elementwise_add_broadcast",
                         &[buf_q.buffer(), &b, &buf_q_dim],
                         total_rows * q_dim,
@@ -3179,7 +3210,7 @@ impl MetalCompute {
                 if let Some(k_bias) = weights.k_bias {
                     let b = self.buf_cached(k_bias)?;
                     self.encode_1d(
-                        cmd1,
+                        cmd,
                         "elementwise_add_broadcast",
                         &[buf_k.buffer(), &b, &buf_kv_dim],
                         total_rows * kv_dim,
@@ -3188,7 +3219,7 @@ impl MetalCompute {
                 if let Some(v_bias) = weights.v_bias {
                     let b = self.buf_cached(v_bias)?;
                     self.encode_1d(
-                        cmd1,
+                        cmd,
                         "elementwise_add_broadcast",
                         &[buf_v.buffer(), &b, &buf_kv_dim],
                         total_rows * kv_dim,
@@ -3197,16 +3228,12 @@ impl MetalCompute {
             }
 
             if let Some(b) = buf_normed1 {
-                retains1.push(b);
+                retains.push(b);
             }
-            self.commit_bounded(cmd1, retains1);
 
             // ---------------------------------------------------------
-            // Command Buffer 2: RoPE + Fused Attention Posmajor + Attn Out Projection + Add Residual
+            // RoPE + Fused Attention Posmajor + Attn Out Projection + Add Residual
             // ---------------------------------------------------------
-            let mut cmd2 = self.queue.new_command_buffer();
-            let mut retains2 = Vec::new();
-
             // Only apply RoPE if cos/sin are provided
             if !rope_cos.is_empty() {
                 let buf_cos = self.buf_cached(rope_cos)?;
@@ -3219,7 +3246,7 @@ impl MetalCompute {
 
                 // Q RoPE
                 {
-                    let enc = cmd2.new_compute_command_encoder();
+                    let enc = cmd.new_compute_command_encoder();
                     let num_pairs = q_dim / head_dim * (head_dim / 2);
                     enc.set_compute_pipeline_state(rope_p);
                     enc.set_buffer(0, Some(buf_q.buffer()), 0);
@@ -3239,7 +3266,7 @@ impl MetalCompute {
 
                 // K RoPE
                 {
-                    let enc = cmd2.new_compute_command_encoder();
+                    let enc = cmd.new_compute_command_encoder();
                     let num_pairs = kv_dim / head_dim * (head_dim / 2);
                     enc.set_compute_pipeline_state(rope_p);
                     enc.set_buffer(0, Some(buf_k.buffer()), 0);
@@ -3268,7 +3295,7 @@ impl MetalCompute {
 
             if kv_heads == heads {
                 self.encode_3d(
-                    cmd2,
+                    cmd,
                     "reshape_qkv_pos_to_head",
                     &[
                         buf_q.buffer(),
@@ -3288,7 +3315,7 @@ impl MetalCompute {
             } else {
                 let buf_kv_heads = self.buf_u32(kv_heads as u32)?;
                 let p = &self.pipelines["reshape_qkv_pos_to_head_gqa"];
-                let enc = cmd2.new_compute_command_encoder();
+                let enc = cmd.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(p);
                 enc.set_buffer(0, Some(buf_q.buffer()), 0);
                 enc.set_buffer(1, Some(buf_k.buffer()), 0);
@@ -3329,7 +3356,7 @@ impl MetalCompute {
             ];
             if use_mma(max_len, max_len, head_dim) {
                 self.encode_mma(
-                    cmd2,
+                    cmd,
                     "batched_matmul_transb_simdgroup",
                     &qk_bufs,
                     max_len,
@@ -3339,7 +3366,7 @@ impl MetalCompute {
                 );
             } else {
                 self.encode_3d(
-                    cmd2,
+                    cmd,
                     "batched_matmul_transb",
                     &qk_bufs,
                     max_len,
@@ -3349,17 +3376,17 @@ impl MetalCompute {
             }
 
             if nan_check {
-                self.commit_wait(cmd2);
+                self.commit_wait(cmd);
                 Self::readback_count_nonfinite(
                     "after batched_matmul_transb",
                     buf_scores.buffer(),
                     score_len,
                 );
-                cmd2 = self.queue.new_command_buffer();
+                cmd = self.queue.new_command_buffer();
             }
 
             self.encode_3d(
-                cmd2,
+                cmd,
                 "scale_mask_alibi_grouped",
                 &[
                     buf_scores.buffer(),
@@ -3376,30 +3403,30 @@ impl MetalCompute {
             );
 
             if nan_check {
-                self.commit_wait(cmd2);
+                self.commit_wait(cmd);
                 Self::readback_count_nonfinite(
                     "after scale_mask_alibi_grouped",
                     buf_scores.buffer(),
                     score_len,
                 );
-                cmd2 = self.queue.new_command_buffer();
+                cmd = self.queue.new_command_buffer();
             }
 
             self.encode_rows_simdgroup(
-                cmd2,
+                cmd,
                 "softmax_rows",
                 &[buf_scores.buffer(), &buf_seq],
                 total_q_heads * max_len,
             );
 
             if nan_check {
-                self.commit_wait(cmd2);
+                self.commit_wait(cmd);
                 Self::readback_count_nonfinite(
                     "after softmax_rows",
                     buf_scores.buffer(),
                     score_len,
                 );
-                cmd2 = self.queue.new_command_buffer();
+                cmd = self.queue.new_command_buffer();
             }
 
             let sv_bufs = [
@@ -3412,7 +3439,7 @@ impl MetalCompute {
             ];
             if use_mma(max_len, head_dim, max_len) {
                 self.encode_mma(
-                    cmd2,
+                    cmd,
                     "batched_matmul_ab_simdgroup",
                     &sv_bufs,
                     max_len,
@@ -3422,7 +3449,7 @@ impl MetalCompute {
                 );
             } else {
                 self.encode_3d(
-                    cmd2,
+                    cmd,
                     "batched_matmul_ab",
                     &sv_bufs,
                     head_dim,
@@ -3433,7 +3460,7 @@ impl MetalCompute {
 
             let buf_attn_out = self.pool.acquire_uninit(total_rows * q_dim * 4)?;
             self.encode_3d(
-                cmd2,
+                cmd,
                 "reshape_head_to_pos",
                 &[
                     buf_out_reshaped.buffer(),
@@ -3452,7 +3479,7 @@ impl MetalCompute {
 
             if use_mma(total_rows, h, q_dim) {
                 self.encode_mma(
-                    cmd2,
+                    cmd,
                     "matmul_transb_simdgroup",
                     &[
                         buf_attn_out.buffer(),
@@ -3469,7 +3496,7 @@ impl MetalCompute {
                 );
             } else {
                 Self::encode_matmul(
-                    cmd2,
+                    cmd,
                     &self.pipelines["matmul_transb"],
                     buf_attn_out.buffer(),
                     &buf_out_w,
@@ -3485,7 +3512,7 @@ impl MetalCompute {
             if let Some(attn_out_bias) = weights.attn_out_bias {
                 let b = self.buf_cached(attn_out_bias)?;
                 self.encode_1d(
-                    cmd2,
+                    cmd,
                     "elementwise_add_broadcast",
                     &[buf_proj_out.buffer(), &b, &buf_h],
                     total_rows * h,
@@ -3493,7 +3520,7 @@ impl MetalCompute {
             }
 
             self.encode_1d(
-                cmd2,
+                cmd,
                 "elementwise_add",
                 &[current_hidden.buffer(), buf_proj_out.buffer()],
                 total_rows * h,
@@ -3503,7 +3530,7 @@ impl MetalCompute {
                 let buf_norm1_w = self.buf_cached(weights.norm1_weight)?;
                 if config.use_rms {
                     self.encode_rows_simdgroup(
-                        cmd2,
+                        cmd,
                         "rms_norm",
                         &[current_hidden.buffer(), &buf_norm1_w, &buf_h, &buf_eps],
                         total_rows,
@@ -3511,7 +3538,7 @@ impl MetalCompute {
                 } else {
                     let buf_norm1_b = self.buf_cached(weights.norm1_bias.unwrap_or(&[]))?;
                     self.encode_rows_simdgroup(
-                        cmd2,
+                        cmd,
                         "layer_norm",
                         &[
                             current_hidden.buffer(),
@@ -3525,31 +3552,27 @@ impl MetalCompute {
                 }
             }
 
-            retains2.push(buf_q);
-            retains2.push(buf_k);
-            retains2.push(buf_v);
-            retains2.push(buf_alibi);
-            retains2.push(buf_q_reshaped);
-            retains2.push(buf_k_reshaped);
-            retains2.push(buf_v_reshaped);
-            retains2.push(buf_scores);
-            retains2.push(buf_out_reshaped);
-            retains2.push(buf_attn_out);
-            retains2.push(buf_proj_out);
-            self.commit_bounded(cmd2, retains2);
+            retains.push(buf_q);
+            retains.push(buf_k);
+            retains.push(buf_v);
+            retains.push(buf_alibi);
+            retains.push(buf_q_reshaped);
+            retains.push(buf_k_reshaped);
+            retains.push(buf_v_reshaped);
+            retains.push(buf_scores);
+            retains.push(buf_out_reshaped);
+            retains.push(buf_attn_out);
+            retains.push(buf_proj_out);
 
             // ---------------------------------------------------------
-            // Command Buffer 3: Norm 2 + FFN + Residual
+            // Norm 2 + FFN + Residual
             // ---------------------------------------------------------
-            let cmd3 = self.queue.new_command_buffer();
-            let mut retains3 = Vec::new();
-
             // Layer norm 2
             let mut buf_normed2 = None;
             if config.pre_ln {
                 let buf = self.pool.acquire_uninit(total_rows * h * 4)?;
                 {
-                    let blit = cmd3.new_blit_command_encoder();
+                    let blit = cmd.new_blit_command_encoder();
                     blit.copy_from_buffer(
                         current_hidden.buffer(),
                         0,
@@ -3562,7 +3585,7 @@ impl MetalCompute {
                 let buf_norm2_w = self.buf_cached(weights.norm2_weight)?;
                 if config.use_rms {
                     self.encode_rows_simdgroup(
-                        cmd3,
+                        cmd,
                         "rms_norm",
                         &[buf.buffer(), &buf_norm2_w, &buf_h, &buf_eps],
                         total_rows,
@@ -3570,7 +3593,7 @@ impl MetalCompute {
                 } else {
                     let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]))?;
                     self.encode_rows_simdgroup(
-                        cmd3,
+                        cmd,
                         "layer_norm",
                         &[buf.buffer(), &buf_norm2_w, &buf_norm2_b, &buf_h, &buf_eps],
                         total_rows,
@@ -3606,7 +3629,7 @@ impl MetalCompute {
 
                 if use_mma(total_rows, inter, h) {
                     self.encode_mma(
-                        cmd3,
+                        cmd,
                         "matmul_transb_simdgroup",
                         &[
                             ffn_in,
@@ -3623,7 +3646,7 @@ impl MetalCompute {
                     );
                 } else {
                     Self::encode_matmul(
-                        cmd3,
+                        cmd,
                         &self.pipelines["matmul_transb"],
                         ffn_in,
                         &buf_wgateup,
@@ -3637,7 +3660,7 @@ impl MetalCompute {
                 }
 
                 self.encode_1d(
-                    cmd3,
+                    cmd,
                     "swiglu_activation_fat",
                     &[buf_gateup.buffer(), buf_act.buffer(), &buf_inter],
                     total_rows * inter,
@@ -3645,7 +3668,7 @@ impl MetalCompute {
 
                 if use_mma(total_rows, h, inter) {
                     self.encode_mma(
-                        cmd3,
+                        cmd,
                         "matmul_transb_simdgroup",
                         &[
                             buf_act.buffer(),
@@ -3662,7 +3685,7 @@ impl MetalCompute {
                     );
                 } else {
                     Self::encode_matmul(
-                        cmd3,
+                        cmd,
                         &self.pipelines["matmul_transb"],
                         buf_act.buffer(),
                         &buf_wdown,
@@ -3675,8 +3698,8 @@ impl MetalCompute {
                     );
                 }
 
-                retains3.push(buf_gateup);
-                retains3.push(buf_act);
+                retains.push(buf_gateup);
+                retains.push(buf_act);
             } else {
                 // Standard GELU FFN
                 let up_weight = weights.ffn_up_weight.ok_or_else(|| {
@@ -3687,7 +3710,7 @@ impl MetalCompute {
 
                 if use_mma(total_rows, inter, h) {
                     self.encode_mma(
-                        cmd3,
+                        cmd,
                         "matmul_transb_simdgroup",
                         &[
                             ffn_in,
@@ -3704,7 +3727,7 @@ impl MetalCompute {
                     );
                 } else {
                     Self::encode_matmul(
-                        cmd3,
+                        cmd,
                         &self.pipelines["matmul_transb"],
                         ffn_in,
                         &buf_wup,
@@ -3720,7 +3743,7 @@ impl MetalCompute {
                 if let Some(up_bias) = weights.ffn_up_bias {
                     let b = self.buf_cached(up_bias)?;
                     self.encode_1d(
-                        cmd3,
+                        cmd,
                         "elementwise_add_broadcast",
                         &[buf_up.buffer(), &b, &buf_inter],
                         total_rows * inter,
@@ -3728,7 +3751,7 @@ impl MetalCompute {
                 }
 
                 self.encode_1d(
-                    cmd3,
+                    cmd,
                     "gelu_activation",
                     &[buf_up.buffer()],
                     total_rows * inter,
@@ -3736,7 +3759,7 @@ impl MetalCompute {
 
                 if use_mma(total_rows, h, inter) {
                     self.encode_mma(
-                        cmd3,
+                        cmd,
                         "matmul_transb_simdgroup",
                         &[
                             buf_up.buffer(),
@@ -3753,7 +3776,7 @@ impl MetalCompute {
                     );
                 } else {
                     Self::encode_matmul(
-                        cmd3,
+                        cmd,
                         &self.pipelines["matmul_transb"],
                         buf_up.buffer(),
                         &buf_wdown,
@@ -3765,13 +3788,13 @@ impl MetalCompute {
                         total_rows,
                     );
                 }
-                retains3.push(buf_up);
+                retains.push(buf_up);
             }
 
             if let Some(down_bias) = weights.ffn_down_bias {
                 let b = self.buf_cached(down_bias)?;
                 self.encode_1d(
-                    cmd3,
+                    cmd,
                     "elementwise_add_broadcast",
                     &[buf_ffn_out.buffer(), &b, &buf_h],
                     total_rows * h,
@@ -3779,7 +3802,7 @@ impl MetalCompute {
             }
 
             self.encode_1d(
-                cmd3,
+                cmd,
                 "elementwise_add",
                 &[current_hidden.buffer(), buf_ffn_out.buffer()],
                 total_rows * h,
@@ -3789,7 +3812,7 @@ impl MetalCompute {
                 let buf_norm2_w = self.buf_cached(weights.norm2_weight)?;
                 if config.use_rms {
                     self.encode_rows_simdgroup(
-                        cmd3,
+                        cmd,
                         "rms_norm",
                         &[current_hidden.buffer(), &buf_norm2_w, &buf_h, &buf_eps],
                         total_rows,
@@ -3797,7 +3820,7 @@ impl MetalCompute {
                 } else {
                     let buf_norm2_b = self.buf_cached(weights.norm2_bias.unwrap_or(&[]))?;
                     self.encode_rows_simdgroup(
-                        cmd3,
+                        cmd,
                         "layer_norm",
                         &[
                             current_hidden.buffer(),
@@ -3812,14 +3835,14 @@ impl MetalCompute {
             }
 
             if let Some(b) = buf_normed2 {
-                retains3.push(b);
+                retains.push(b);
             }
-            retains3.push(buf_ffn_out);
+            retains.push(buf_ffn_out);
 
             if is_last {
-                self.commit_wait(cmd3);
+                self.commit_wait(cmd);
             } else {
-                self.commit_bounded(cmd3, retains3);
+                self.commit_bounded(cmd, retains);
             }
             Ok(())
         })
@@ -5495,6 +5518,30 @@ mod tests {
         assert_eq!(
             tags,
             vec!["matmul", "attention", "norm", "activation", "copy"]
+        );
+    }
+
+    #[test]
+    fn test_profile_round_trip_counter_contract() {
+        reset_profile();
+        record_forward_calls(2);
+        if profile_enabled() {
+            assert_eq!(profile_forward_calls(), 2);
+        } else {
+            assert_eq!(profile_forward_calls(), 0);
+            assert_eq!(profile_round_trips(), 0);
+            return;
+        }
+
+        let Some(metal) = get_metal() else { return };
+        let mut data = vec![0.0, 1.0, -1.0];
+        metal.gelu(&mut data).unwrap();
+
+        assert_eq!(profile_round_trips(), 1);
+        assert_eq!(profile_submissions(), 1);
+        assert!(
+            profile_host_blocked_nanos() > 0,
+            "commit_wait should report host-blocked wait time"
         );
     }
 

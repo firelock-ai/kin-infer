@@ -1329,7 +1329,7 @@ version = "0.1.0"
 
 [[patch.unused]]
 name = "kin-db"
-version = "0.2.11"
+version = "0.2.12"
 
 [[patch.unused]]
 name = "kin-model"
