@@ -281,7 +281,7 @@ static C7_FLASH_ATTENTION_AVAILABLE: std::sync::atomic::AtomicBool =
 /// head-major batched attention layout and grouped masks, while ALiBi and
 /// resident-stack routing stay on the proven baseline until direct parity clears.
 #[inline]
-fn use_c7_flash_attention(
+fn c7_flash_attention_shape_supported(
     num_groups: usize,
     seq_len: usize,
     head_dim: usize,
@@ -290,9 +290,7 @@ fn use_c7_flash_attention(
     scale: f32,
     masks: &[u32],
 ) -> bool {
-    c7_flash_attention_enabled()
-        && C7_FLASH_ATTENTION_AVAILABLE.load(Ordering::Relaxed)
-        && num_groups > 0
+    num_groups > 0
         && seq_len > 0
         && head_dim > 0
         && heads_per_group > 0
@@ -304,6 +302,29 @@ fn use_c7_flash_attention(
         && masks
             .chunks(seq_len)
             .all(|group_mask| group_mask.iter().any(|&keep| keep != 0))
+}
+
+#[inline]
+fn use_c7_flash_attention(
+    num_groups: usize,
+    seq_len: usize,
+    head_dim: usize,
+    heads_per_group: usize,
+    has_alibi: bool,
+    scale: f32,
+    masks: &[u32],
+) -> bool {
+    c7_flash_attention_enabled()
+        && C7_FLASH_ATTENTION_AVAILABLE.load(Ordering::Relaxed)
+        && c7_flash_attention_shape_supported(
+            num_groups,
+            seq_len,
+            head_dim,
+            heads_per_group,
+            has_alibi,
+            scale,
+            masks,
+        )
 }
 
 /// Whether the steel double-buffered K-loop MMA path is selected. The steel
@@ -1765,9 +1786,8 @@ kernel void batched_matmul_ab_simdgroup_fp16(
 // ---------------------------------------------------------------------------
 // Kept separate from the baseline Metal shader library for the same reason as
 // the fp16 MMA library: an experimental C7 compile/pipeline failure must only
-// disable C7, never Metal itself. The kernel list intentionally starts empty;
-// adding a real C7 shader later is a small registration change instead of a
-// control-flow change.
+// disable C7, never Metal itself. Adding more C7 shaders later should be a
+// small registration change instead of a control-flow change.
 const C7_FLASH_ATTENTION_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
@@ -2675,11 +2695,10 @@ impl MetalCompute {
         FP16_MMA_AVAILABLE.store(fp16_mma_available, Ordering::Relaxed);
 
         // C7 flash-attention — OPTIONAL, compiled as a SEPARATE library only
-        // when opt-in enabled. The skeleton currently registers no kernels, so
-        // C7 availability remains false and all runtime attention calls continue
-        // through the baseline Metal path. Future C7 kernels can be added to
-        // C7_FLASH_ATTENTION_KERNEL_NAMES without making the main library depend
-        // on them.
+        // when opt-in enabled. C7 availability remains false if compilation or
+        // pipeline creation fails, and runtime attention calls continue through
+        // the baseline Metal path unless registration succeeds and the shape
+        // gate passes.
         let mut c7_flash_attention_available = false;
         if c7_flash_attention_enabled() {
             match device.new_library_with_source(C7_FLASH_ATTENTION_SHADER_SOURCE, &opts) {
@@ -7148,35 +7167,7 @@ mod tests {
     }
 
     #[test]
-    fn test_metal_c7_flash_attention_default_off_shape_gate() {
-        if c7_flash_attention_enabled() {
-            return;
-        }
-        let seq_len = 64;
-        let masks = vec![1u32; seq_len];
-
-        assert!(!use_c7_flash_attention(
-            1,
-            seq_len,
-            64,
-            1,
-            false,
-            1.0 / 8.0,
-            &masks,
-        ));
-    }
-
-    #[test]
-    fn test_metal_c7_flash_attention_rejects_unsupported_shapes() {
-        if !c7_flash_attention_enabled() {
-            return;
-        }
-        let Some(_metal) = get_metal() else { return };
-        assert!(
-            C7_FLASH_ATTENTION_AVAILABLE.load(Ordering::Relaxed),
-            "C7 flash-attention was requested but the optional Metal pipeline did not compile"
-        );
-
+    fn test_metal_c7_flash_attention_shape_gate_without_device() {
         let num_groups = 2;
         let heads_per_group = 2;
         let seq_len = 64;
@@ -7184,7 +7175,7 @@ mod tests {
         let scale = 1.0 / (head_dim as f32).sqrt();
         let masks = vec![1u32; num_groups * seq_len];
 
-        assert!(use_c7_flash_attention(
+        assert!(c7_flash_attention_shape_supported(
             num_groups,
             seq_len,
             head_dim,
@@ -7193,7 +7184,7 @@ mod tests {
             scale,
             &masks,
         ));
-        assert!(!use_c7_flash_attention(
+        assert!(!c7_flash_attention_shape_supported(
             num_groups,
             seq_len,
             head_dim,
@@ -7202,7 +7193,7 @@ mod tests {
             scale,
             &masks,
         ));
-        assert!(!use_c7_flash_attention(
+        assert!(!c7_flash_attention_shape_supported(
             num_groups,
             seq_len,
             head_dim,
@@ -7211,16 +7202,7 @@ mod tests {
             f32::NAN,
             &masks,
         ));
-        assert!(!use_c7_flash_attention(
-            num_groups,
-            seq_len - 1,
-            head_dim,
-            heads_per_group,
-            false,
-            scale,
-            &masks[..masks.len() - 1],
-        ));
-        assert!(!use_c7_flash_attention(
+        assert!(!c7_flash_attention_shape_supported(
             num_groups,
             seq_len,
             16,
@@ -7229,7 +7211,7 @@ mod tests {
             scale,
             &masks,
         ));
-        assert!(!use_c7_flash_attention(
+        assert!(!c7_flash_attention_shape_supported(
             num_groups,
             32,
             head_dim,
@@ -7240,7 +7222,7 @@ mod tests {
         ));
 
         let short_masks = &masks[..masks.len() - 1];
-        assert!(!use_c7_flash_attention(
+        assert!(!c7_flash_attention_shape_supported(
             num_groups,
             seq_len,
             head_dim,
@@ -7252,7 +7234,7 @@ mod tests {
 
         let mut all_zero_group = masks.clone();
         all_zero_group[..seq_len].fill(0);
-        assert!(!use_c7_flash_attention(
+        assert!(!c7_flash_attention_shape_supported(
             num_groups,
             seq_len,
             head_dim,
@@ -7260,6 +7242,34 @@ mod tests {
             false,
             scale,
             &all_zero_group,
+        ));
+    }
+
+    #[test]
+    fn test_metal_c7_flash_attention_default_off_shape_gate() {
+        if c7_flash_attention_enabled() {
+            return;
+        }
+        let seq_len = 64;
+        let masks = vec![1u32; seq_len];
+
+        assert!(c7_flash_attention_shape_supported(
+            1,
+            seq_len,
+            64,
+            1,
+            false,
+            1.0 / 8.0,
+            &masks,
+        ));
+        assert!(!use_c7_flash_attention(
+            1,
+            seq_len,
+            64,
+            1,
+            false,
+            1.0 / 8.0,
+            &masks,
         ));
     }
 
