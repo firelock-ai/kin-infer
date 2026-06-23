@@ -1675,6 +1675,12 @@ static inline void block_mma_fp16(
     constexpr uint BK = 16, WM = 2, WN = 2, F = 8;
     constexpr uint TM = BM / (F * WM);
     constexpr uint TN = BN / (F * WN);
+    // The WMxWN simdgroups tile a TMxTN grid of FxF fragments, covering exactly
+    // F*WM*TM by F*WN*TN. Require that to equal BMxBN so a tile that is not a
+    // whole multiple of F*WM / F*WN fails to build instead of staging only part
+    // of the output (the half-MMA-at-64x64 hazard).
+    static_assert(F * WM * TM == BM && F * WN * TN == BN,
+                  "block_mma_fp16: BM/BN must be whole multiples of F*WM / F*WN");
 
     const uint sm = sgid / WN;
     const uint sn = sgid % WN;
@@ -1830,6 +1836,14 @@ kernel void matmul_transb_simdgroup_fp16_wide(
     threadgroup half As[64][MMA_BK];
     threadgroup half Bs[64][MMA_BK];
     threadgroup float store_tile[2 * 2][MMA_F][MMA_F];
+    // block_mma_fp16<true,64,64> blocks over a 64x64 output, so the A/B stage must
+    // hold 64 rows; a 32-row stage would leave half the tile unstaged (the prior
+    // half-MMA-at-64x64 parity bug). Couple the stage size to the 64 tile at
+    // compile time so the two can never drift apart.
+    static_assert(sizeof(As) / sizeof(As[0]) == 64,
+                  "fp16 wide: As must stage 64 M-rows for the 64x64 tile");
+    static_assert(sizeof(Bs) / sizeof(Bs[0]) == 64,
+                  "fp16 wide: Bs must stage 64 N-rows for the 64x64 tile");
     block_mma_fp16<true, 64, 64>(A, B, C, M, N, K, tgid, sgid, lane, tpsg, As, Bs, store_tile);
 }
 "#;
@@ -8068,15 +8082,22 @@ mod tests {
             out.iter().all(|x| x.is_finite()),
             "fp16+wide MMA produced non-finite output"
         );
-        let max_err: f32 = out
+        // Mixed absolute/relative tolerance: |x-y| <= atol + rtol*max(|x|,|y|).
+        // fp16 operands over a K=64 contraction give ~rtol relative error, but
+        // sign-cancelling near-zero C entries have a tiny denominator under a pure
+        // relative metric and would read as spurious parity failures; the absolute
+        // floor (atol) absorbs those. `worst` is the largest amount any element
+        // exceeds its bound — <= 0 means every element is within tolerance.
+        let atol = 2e-3f32;
+        let rtol = 5e-2f32;
+        let worst: f32 = out
             .iter()
             .zip(cpu_out.iter())
-            .map(|(x, y)| (x - y).abs() / x.abs().max(y.abs()).max(1e-6))
-            .fold(0.0f32, f32::max);
+            .map(|(x, y)| (x - y).abs() - (atol + rtol * x.abs().max(y.abs())))
+            .fold(f32::NEG_INFINITY, f32::max);
         assert!(
-            max_err < 5e-2,
-            "fp16+wide MMA vs CPU matmul max err: {}",
-            max_err
+            worst <= 0.0,
+            "fp16+wide MMA vs CPU exceeds mixed abs/rel tol (atol={atol}, rtol={rtol}): worst excess {worst}"
         );
     }
 
