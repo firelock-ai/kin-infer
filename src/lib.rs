@@ -2411,14 +2411,14 @@ impl BertModel {
             let layer_tensors: Vec<crate::gpu::LayerTensors> = (0..self.config.num_hidden_layers)
                 .map(|i| self.layer_tensors(&self.weights.layers[i % num_groups]))
                 .collect();
-            let segment_count = if use_segmented {
-                layer_tensors.len().div_ceil(caps.segment_layers).max(1)
-            } else {
-                1
-            };
             let hidden_flat = hidden
                 .as_slice()
                 .expect("activation buffer is row-major contiguous");
+            // Prefer the whole-stack resident pass. When it does not fit the
+            // (jetsam-safe) resident budget it returns None — segment the layers
+            // so residency still engages instead of dropping to the per-op path.
+            // `segmented` tracks which path actually produced the output.
+            let mut segmented = use_segmented;
             let maybe_out = if use_segmented {
                 gpu.forward_layers_batched_segmented(
                     hidden_flat,
@@ -2430,14 +2430,33 @@ impl BertModel {
                     caps.segment_layers,
                 )?
             } else {
-                gpu.forward_layers_batched(
+                match gpu.forward_layers_batched(
                     hidden_flat,
                     &flat_masks,
                     &layer_tensors,
                     &layer_config,
                     rope_cos_slice,
                     rope_sin_slice,
-                )?
+                )? {
+                    Some(out) => Some(out),
+                    None => {
+                        segmented = true;
+                        gpu.forward_layers_batched_segmented(
+                            hidden_flat,
+                            &flat_masks,
+                            &layer_tensors,
+                            &layer_config,
+                            rope_cos_slice,
+                            rope_sin_slice,
+                            caps.segment_layers,
+                        )?
+                    }
+                }
+            };
+            let segment_count = if segmented {
+                layer_tensors.len().div_ceil(caps.segment_layers).max(1)
+            } else {
+                1
             };
             if let Some(out) = maybe_out {
                 hidden = Array2::from_shape_vec((total_rows, h), out).map_err(|e| {
@@ -2445,7 +2464,7 @@ impl BertModel {
                 })?;
                 layers_resident = true;
                 record_resident_stack_decision(
-                    if use_segmented {
+                    if segmented {
                         ResidentStackDecisionReason::UsedSegmented
                     } else {
                         ResidentStackDecisionReason::Used
