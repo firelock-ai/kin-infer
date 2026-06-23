@@ -3092,14 +3092,15 @@ impl BertModel {
             eps,
         };
 
-        let segment_count = if use_segmented {
-            layer_tensors.len().div_ceil(caps.segment_layers).max(1)
-        } else {
-            1
-        };
         let hidden_flat = hidden
             .as_slice()
             .expect("activation buffer is row-major contiguous");
+        // Prefer the whole-stack resident pooled pass. When it does not fit the
+        // (jetsam-safe) resident budget it returns None — segment the layers so
+        // residency still engages on the fused prelude+pool path instead of
+        // dropping to the per-op path. `segmented` tracks which path produced the
+        // output so the decision log and segment count stay accurate.
+        let mut segmented = use_segmented;
         let maybe_flat = if use_segmented {
             gpu.forward_layers_batched_pooled_segmented(
                 hidden_flat,
@@ -3113,7 +3114,7 @@ impl BertModel {
                 caps.segment_layers,
             )?
         } else {
-            gpu.forward_layers_batched_pooled(
+            match gpu.forward_layers_batched_pooled(
                 hidden_flat,
                 &flat_masks,
                 &layer_tensors,
@@ -3122,7 +3123,23 @@ impl BertModel {
                 rope_cos_slice,
                 rope_sin_slice,
                 pooling,
-            )?
+            )? {
+                Some(out) => Some(out),
+                None => {
+                    segmented = true;
+                    gpu.forward_layers_batched_pooled_segmented(
+                        hidden_flat,
+                        &flat_masks,
+                        &layer_tensors,
+                        &layer_config,
+                        &embedding,
+                        rope_cos_slice,
+                        rope_sin_slice,
+                        pooling,
+                        caps.segment_layers,
+                    )?
+                }
+            }
         };
 
         let Some(flat) = maybe_flat else {
@@ -3141,7 +3158,12 @@ impl BertModel {
             )));
         }
         let pooled = flat.chunks_exact(h).map(l2_normalize_to_vec).collect();
-        let reason = if use_segmented {
+        let segment_count = if segmented {
+            layer_tensors.len().div_ceil(caps.segment_layers).max(1)
+        } else {
+            1
+        };
+        let reason = if segmented {
             PooledOutputDecisionReason::UsedSegmented
         } else {
             PooledOutputDecisionReason::Used
