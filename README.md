@@ -56,8 +56,8 @@ The two GPU backends are not at the same depth.
 **Metal is the developed path.** It overrides every operation in the
 `GpuCompute` trait, including fused attention, the fused SwiGLU FFN, the fused
 linear-add-norm folds, and the resident multi-layer forward paths that keep a
-whole batch on device across layers. It is also where nearly all of the test
-suite points.
+whole batch on device across layers. Most of the crate's dedicated backend
+tests point at it: 20 of the 21 files under `tests/` are Metal-gated.
 
 **CUDA is real but narrower.** It JIT-compiles embedded PTX through the CUDA
 driver API, so it needs the NVIDIA driver and no toolkit at build time. It
